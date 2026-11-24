@@ -1,9 +1,13 @@
-name: Build Windows EXE
+name: Build Windows EXE and publish release
 
 on:
   push:
     branches: [main]
-  workflow_dispatch:      # lets you press a "Run workflow" button
+    paths: ["PrintShopOrganizer.py"]   # only rebuild when the program changes
+  workflow_dispatch:                   # lets you press a "Run workflow" button
+
+permissions:
+  contents: write                      # needed to publish the release
 
 jobs:
   build:
@@ -15,14 +19,25 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Stamp version and repository into the program
+        shell: python
+        run: |
+          p = "PrintShopOrganizer.py"
+          s = open(p, encoding="utf-8").read()
+          s = s.replace('APP_VERSION = "0"', 'APP_VERSION = "${{ github.run_number }}"')
+          s = s.replace('GITHUB_REPO = ""', 'GITHUB_REPO = "${{ github.repository }}"')
+          open(p, "w", encoding="utf-8").write(s)
+
       - name: Install tools
         run: pip install pyinstaller pillow pypdf
 
       - name: Build EXE
         run: pyinstaller --noconfirm --onefile --windowed --name PrintShopOrganizer PrintShopOrganizer.py
 
-      - name: Save the EXE for download
-        uses: actions/upload-artifact@v4
+      - name: Publish release (this is what triggers the update popup)
+        uses: softprops/action-gh-release@v2
         with:
-          name: PrintShopOrganizer
-          path: dist/PrintShopOrganizer.exe
+          tag_name: v${{ github.run_number }}
+          name: Version ${{ github.run_number }}
+          body: ${{ github.event.head_commit.message }}
+          files: dist/PrintShopOrganizer.exe
