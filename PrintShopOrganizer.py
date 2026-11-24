@@ -17,7 +17,9 @@ import time
 import shutil
 import sqlite3
 import threading
+import tempfile
 import subprocess
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -32,6 +34,10 @@ try:
     from pypdf import PdfReader    # optional: PDF page count + text search
 except Exception:
     PdfReader = None
+
+# GitHub fills these two lines in automatically when it builds the .exe.
+APP_VERSION = "0"
+GITHUB_REPO = ""
 
 # ----------------------------------------------------------------- settings
 # You can edit these two tables to fit your shop.
@@ -424,23 +430,51 @@ def show_in_folder(path):
         open_path(os.path.dirname(path))
 
 
+# ------------------------------------------------------------- auto-update
+def is_frozen():
+    return bool(getattr(sys, "frozen", False))
+
+
+def _get(url, timeout=15):
+    return urllib.request.urlopen(
+        urllib.request.Request(url, headers={"User-Agent": "PrintShopOrganizer"}), timeout=timeout)
+
+
+def check_update():
+    """Return info dict if a newer release exists on GitHub, else None."""
+    if not (is_frozen() and GITHUB_REPO):
+        return None
+    with _get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest") as r:
+        data = json.load(r)
+    tag = str(data.get("tag_name", "")).lstrip("vV")
+    if not tag.isdigit() or not APP_VERSION.isdigit() or int(tag) <= int(APP_VERSION):
+        return None
+    for a in data.get("assets", []):
+        if a.get("name", "").lower().endswith(".exe"):
+            return {"tag": tag, "url": a["browser_download_url"],
+                    "size": a.get("size", 0), "notes": data.get("body") or ""}
+    return None
+
+
 class App(tk.Tk):
     COLS = [("name", "Name", 430), ("cat", "Type", 110), ("date", "Date", 90),
             ("size", "Size", 80), ("folder", "Folder", 230)]
 
     def __init__(self):
         super().__init__()
-        self.title("Print Shop Organizer")
+        self.title("Print Shop Organizer" + (f"  v{APP_VERSION}" if APP_VERSION != "0" else ""))
         self.geometry("1050x620")
         self.cfg = load_config()
         self.index = Index()
         self.org = Organizer(self.cfg, self.index)
         self.rows = []
         self._job = None
+        self._asked = set()
         self._build()
         self.auto.set(bool(self.cfg.get("auto", True)))
         threading.Thread(target=self._watch_loop, daemon=True).start()
         threading.Thread(target=self._initial_index, daemon=True).start()
+        threading.Thread(target=self._update_loop, daemon=True).start()
         self.do_search()
 
     # ---- layout
@@ -461,6 +495,9 @@ class App(tk.Tk):
         ttk.Button(bar, text="Undo last organize", command=self.undo).pack(side="left", padx=6)
         ttk.Button(bar, text="Re-scan library", command=self.rescan).pack(side="left")
         ttk.Button(bar, text="Settings", command=self.settings).pack(side="left", padx=6)
+        ttk.Button(bar, text="Check for updates",
+                   command=lambda: threading.Thread(target=self._check_update, args=(True,),
+                                                    daemon=True).start()).pack(side="left")
         self.auto = tk.BooleanVar(value=True)
         ttk.Checkbutton(bar, text="Auto-organize Downloads", variable=self.auto,
                         command=self._save_auto).pack(side="right")
@@ -582,6 +619,81 @@ class App(tk.Tk):
             n = fn()
             self.after(0, self._done, msg_fmt.format(n))
         threading.Thread(target=job, daemon=True).start()
+
+    # ---- updates
+    def _update_loop(self):
+        time.sleep(5)
+        while True:
+            self._check_update(manual=False)
+            time.sleep(6 * 3600)                     # check again every 6 hours
+
+    def _check_update(self, manual):
+        try:
+            info = check_update()
+        except Exception as e:
+            if manual:
+                msg = str(e)
+                self.after(0, lambda: messagebox.showwarning(
+                    "Update", "Could not check for updates (is the internet on?).\n\n" + msg))
+            return
+        if info is None:
+            if manual:
+                text = ("You already have the latest version." if is_frozen() and GITHUB_REPO else
+                        "Auto-update only works in the installed .exe version.")
+                self.after(0, lambda: messagebox.showinfo("Update", text))
+            return
+        if info["tag"] in self._asked and not manual:
+            return                                   # already asked this session
+        self._asked.add(info["tag"])
+        self.after(0, lambda: self._offer(info))
+
+    def _offer(self, info):
+        notes = info["notes"].strip()[:400]
+        msg = f"A new version (v{info['tag']}) is available.\nYou have v{APP_VERSION}."
+        if notes:
+            msg += f"\n\nWhat's new:\n{notes}"
+        msg += "\n\nUpdate now? The program will close and open again by itself."
+        if messagebox.askyesno("Update available", msg):
+            self.status.set("Downloading update...")
+            threading.Thread(target=self._do_update, args=(info,), daemon=True).start()
+
+    def _do_update(self, info):
+        try:
+            cur = Path(sys.executable)
+            new = cur.with_name(cur.stem + "_new.exe")
+            with _get(info["url"], timeout=60) as r, open(new, "wb") as f:
+                total = int(r.headers.get("Content-Length") or info["size"] or 0)
+                done = 0
+                while True:
+                    chunk = r.read(256 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    if total:
+                        self.after(0, self.status.set, f"Downloading update... {done * 100 // total}%")
+            if info["size"] and new.stat().st_size != info["size"]:
+                raise IOError("The downloaded file is incomplete. Please try again.")
+            bat = Path(tempfile.gettempdir()) / "printshop_update.bat"
+            bat.write_text(
+                "@echo off\n"
+                "for /l %%i in (1,1,30) do (\n"
+                f'  move /y "{new}" "{cur}" >nul 2>&1 && goto done\n'
+                "  timeout /t 1 /nobreak >nul\n"
+                ")\n"
+                "exit /b 1\n"
+                ":done\n"
+                f'start "" "{cur}"\n'
+                '(goto) 2>nul & del "%~f0"\n')
+            subprocess.Popen(["cmd", "/c", str(bat)], creationflags=0x08000000)  # no black window
+            self.after(0, self._quit_now)
+        except Exception as e:
+            msg = str(e)
+            self.after(0, lambda: messagebox.showerror("Update failed", msg))
+
+    def _quit_now(self):
+        self.destroy()
+        os._exit(0)
 
     # ---- watched folders
     def refresh_watch_list(self):
